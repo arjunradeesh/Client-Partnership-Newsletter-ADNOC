@@ -24,30 +24,25 @@ Headline: *Raducanu to make return with wildcard in Strasbourg* (BBC Sport)
 
 ## Competitor News: what counts
 
-Competitor News tracks **these banks only** doing sponsorship or partnership
-deals in **sport or the arts**, anywhere in the world:
+Competitor News tracks **these energy companies only** doing sponsorship or partnership
+deals in **sport**, anywhere in the world:
 
-Barclays, Lloyds Bank, NatWest, Santander UK, Nationwide, Royal Bank of Scotland,
-Virgin Money, Metro Bank, Monzo, Starling Bank, Revolut, Chase UK, Standard
-Chartered, Citi, J.P. Morgan (JPMorganChase), BNP Paribas, Deutsche Bank, UBS.
-
-Arts deals count as much as sport: art collections and fairs (e.g. UBS and Art
-Basel), exhibitions, museums, festivals, theatre, orchestras and music.
+ADNOC, ARAMCO, TotalEnergies, Shell Energies, Petronas, ExxonMobil,
+Emirates, Etisalat, DP World, Aldar, Mubadala
 
 Examples of stories that belong:
 
-- Monzo becomes official banking partner of The Hundred (cricket)
-- JPMorganChase becomes the Dallas Mavericks' jersey patch and banking partner
-- Lloyds and British Cycling launch the Sofa to Saddle app
-- JPMorgan agrees a $15m-a-year jersey patch deal with Ohio State
-- Miami HEAT and JPMorganChase enter a multi-year partnership
-- Revolut and MOJOE launch an athlete career-transition programme
-- Lloyds becomes England Rugby's first back-of-shirt partner
-- UBS art advisors start a contemporary art collection
+- UAE Pro League and ADNOC extend partnership until 2029
+- Abu Dhabi Grand Prix retains ADNOC as key partner under new extension
+- Abu Dhabi Turf Club, ADNOC sign three-year sponsorship agreement for inaugural Abu Dhabi Gold Cup
+- FIFA signs four year worldwide partnership deal with Saudi Aramco
+- Saudi Arabia sports sponsorship: Fifa, F1 and ICC challenged over Aramco deals
+- Al Ahly renew partnership with global energy company ‘Shell’
+- ExxonMobil lands deals with three NBA teams
+- TotalEnergies Qatar named official sponsor of FIP World Cup Qatar 2026
 
-New deals, renewals, extensions, exits and activations all count. Other banks,
-payment companies (Visa, Mastercard, Adyen, PayPal, Amex), takeovers, earnings,
-general banking news and HSBC's own deals don't count.
+New deals, renewals, extensions, exits and activations all count. Other energy companies,
+takeovers, earnings,general energy news and ADNOC's own deals don't count.
 
 **For every story in every section**, set `"competitor": true` if the story is
 mainly about a deal like this. It will then be moved into Competitor News. For
