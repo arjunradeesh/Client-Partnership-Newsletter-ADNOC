@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+ADNOC sports & sponsorship news digest.
+
+Pulls RSS feeds + Google News searches, filters them per section, de-dupes,
+and writes JSON in the same shape as the original agent:
+  generated_at, generated_label, window_hours, section_order, sections{}, total
+
+Usage:
+  python adnoc_digest.py                 # last 48h -> output/adnoc_digest.json
+  python adnoc_digest.py --hours 336     # last 14 days (bi-weekly newsletter)
+  python adnoc_digest.py --no-body       # skip fetching article bodies (faster)
+"""
+import argparse
+import json
+import math
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
+
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+
+# --------------------------------------------------------------------------
+# GENERAL SETTINGS
+# --------------------------------------------------------------------------
+LOCAL_TZ = ZoneInfo("Asia/Dubai")          # labels shown in Gulf time
+DEFAULT_HOURS = 48
+OUTPUT_PATH = Path("output/adnoc_digest.json")
+USER_AGENT = "Mozilla/5.0 (compatible; ADNOC-Digest/1.0)"
+TIMEOUT = 20
+
+GNEWS_URL = "https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={gl}:{hl}"
+
+# Words that prove a story is about sport/sponsorship (used where a feed or
+# query could drift into oil prices, travel visas, etc.)
+SPORT_CONTEXT = [
+    "sport", "sponsor", "partner", "partnership", "ambassador", "activation",
+    "campaign", "deal", "f1", "formula", "grand prix", "motorsport", "racing",
+    "race", "football", "fifa", "world cup", "league", "club", "stadium",
+    "golf", "cricket", "cycling", "tour de france", "marathon", "run",
+    "triathlon", "tennis", "olympic", "tournament", "championship", "team",
+    "fan", "esports",
+    # Arabic
+    "رياض", "رعاية", "شراك", "دوري", "ماراثون", "سباق", "الفورمولا", "كرة", "بطولة",
+]
+
+# Headlines that are site homepages, live blogs or tip sheets, not stories
+JUNK_TITLE_PATTERNS = [
+    r"\|\s*(official site|watch live|latest news|scores)",
+    r"^sports news, transfers",
+    r"\blive!?$",
+    r"head the market",
+    r"^\d{1,2}\.\d{2}\s+[A-Z]",          # racecards like "2.10 Chester - ..."
+]
+
+# --------------------------------------------------------------------------
+# SECTIONS
+# Order matters: an article goes to the FIRST section that claims it.
+#   feeds:    direct RSS feeds   (kind = "direct", body is scraped)
+#   queries:  Google News search (kind = "gnews", body left empty)
+#   include:  if set, the story must mention at least one of these
+#   exclude:  drop the story if it mentions any of these
+#   require_context: story must mention a SPORT_CONTEXT word
+# --------------------------------------------------------------------------
+SECTIONS = [
+    {
+        "name": "ADNOC & Partner News",
+        "require_context": True,
+        "max": 15,
+        "queries": [
+            {"q": '"ADNOC" (sponsorship OR partnership OR sponsor OR sport)'},
+            {"q": '"ADNOC" ("Grand Prix" OR marathon OR cycling OR "Pro League" OR triathlon)'},
+            {"q": '"XRG" ("UAE Team Emirates" OR sponsorship OR sport)'},
+            {"q": '"Energy in Every Move" ADNOC'},
+            {"q": "أدنوك رعاية رياضية", "hl": "ar", "source_hint": "Arabic press"},
+        ],
+        "exclude": ["share price", "barrels", "ipo", "dividend", "bond issue"],
+    },
+    {
+        "name": "Formula 1 & Motorsport",
+        "max": 15,
+        "feeds": [
+            {"source": "BBC Sport", "url": "https://feeds.bbci.co.uk/sport/formula1/rss.xml"},
+        ],
+        "queries": [
+            {"q": '"Abu Dhabi Grand Prix" OR "Yas Marina Circuit"'},
+            {"q": '"Rashid Al Dhaheri"'},
+            {"q": '"FIA Formula 3" OR "Formula 2" OR "F1 Academy"'},
+            {"q": '"F4 UAE" OR "Formula Regional Middle East"'},
+            {"q": '"Formula 1" (sponsorship OR partnership OR "title partner")'},
+        ],
+    },
+    {
+        "name": "Cycling",
+        "max": 12,
+        "feeds": [
+            {"source": "BBC Sport", "url": "https://feeds.bbci.co.uk/sport/cycling/rss.xml"},
+        ],
+        "queries": [
+            {"q": '"UAE Team Emirates"'},
+            {"q": '"UAE Tour" cycling'},
+            {"q": "Pogacar"},
+            {"q": "site:cyclingnews.com"},
+        ],
+    },
+    {
+        "name": "UAE Pro League & GCC Football",
+        "max": 15,
+        "queries": [
+            {"q": '"ADNOC Pro League"'},
+            {"q": '"UAE Pro League" OR "Al Ain FC" OR "Shabab Al Ahli" OR "Al Wahda" OR "Al Jazira club"'},
+            {"q": '"Saudi Pro League"'},
+            {"q": '"AFC Champions League Elite"'},
+            {"q": '"Qatar Stars League"'},
+            {"q": "دوري أدنوك للمحترفين", "hl": "ar"},
+        ],
+        "exclude": ["fantasy", "betting tips", "prediction", "odds"],
+    },
+    {
+        "name": "Running & Endurance",
+        "max": 10,
+        "queries": [
+            {"q": '"Abu Dhabi Marathon"'},
+            {"q": '"Dubai Marathon" OR "Dubai Run"'},
+            {"q": '"Challenge Sir Bani Yas" OR "Open Masters Games"'},
+            {"q": "marathon UAE"},
+        ],
+    },
+    {
+        "name": "Wider Sports Business",
+        "max": 18,
+        "feeds": [
+            {"source": "SportBusiness", "url": "https://www.sportbusiness.com/feed/"},
+            {"source": "Sport Industry", "url": "https://sportindustry.co.uk/feed/"},
+        ],
+        "queries": [
+            {"q": "site:sportcal.com", "source_hint": "Sportcal"},
+            {"q": "site:sportspromedia.com", "source_hint": "SportsPro"},
+            {"q": 'site:thenationalnews.com sport (sponsorship OR partnership OR deal)', "source_hint": "The National"},
+            {"q": 'site:arabnews.com sport (sponsorship OR partnership OR deal)', "source_hint": "Arab News"},
+            {"q": '"sports sponsorship" (Gulf OR UAE OR Saudi OR Qatar)'},
+        ],
+    },
+]
+
+# Competitor watch. Each brand becomes a Google News query, and a story only
+# counts if the brand name is in the headline AND it has sport/sponsorship
+# context. This is what stops "Visa" pulling in travel-visa stories.
+# NOTE: this is a starting list. Swap in the client's agreed benchmark set.
+COMPETITORS = {
+    "max": 25,
+    "brands": {
+        # Energy peers
+        "Aramco":        {"aliases": ["Aramco"]},
+        "QatarEnergy":   {"aliases": ["QatarEnergy", "Qatar Energy"]},
+        "Petronas":      {"aliases": ["Petronas"]},
+        "Shell":         {"aliases": ["Shell"]},             # case-sensitive, so "shell" won't match
+        "TotalEnergies": {"aliases": ["TotalEnergies"]},
+        "BP":            {"aliases": ["BP", "Castrol"]},
+        "ExxonMobil":    {"aliases": ["ExxonMobil", "Mobil 1"]},
+        # Gulf sponsorship peers (compete for the same properties & attention)
+        "Emirates":      {"aliases": ["Emirates airline", "Fly Emirates", "Emirates Group"],
+                          "q": '"Emirates airline" OR "Fly Emirates" sponsorship'},
+        "Etihad":        {"aliases": ["Etihad Airways"]},
+        "Qatar Airways": {"aliases": ["Qatar Airways"]},
+        "Riyadh Air":    {"aliases": ["Riyadh Air"]},
+        "PIF":           {"aliases": ["PIF", "Public Investment Fund"]},
+        "NEOM":          {"aliases": ["NEOM"]},
+    },
+}
+COMPETITOR_SECTION = "Competitor News"
+
+# --------------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------------
+session = requests.Session()
+session.headers["User-Agent"] = USER_AGENT
+
+
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+def clean_text(raw):
+    if not raw:
+        return ""
+    text = BeautifulSoup(raw, "html.parser").get_text(" ")
+    text = re.sub(r"The post .+? appeared first on .+?\.?$", "", text.strip())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def entry_time(entry):
+    for key in ("published_parsed", "updated_parsed"):
+        t = entry.get(key)
+        if t:
+            return datetime(*t[:6], tzinfo=timezone.utc)
+    return None
+
+
+def fetch_feed(url):
+    try:
+        r = session.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+        return feedparser.parse(r.content).entries
+    except Exception as e:
+        log(f"  ! feed failed: {url} ({e})")
+        return []
+
+
+def gnews_url(q, hl="en", days=2):
+    query = f"{q} when:{days}d"
+    return GNEWS_URL.format(q=quote_plus(query), hl=hl, gl="AE")
+
+
+def split_gnews_title(title, source):
+    """Google News titles end with ' - Publisher'. Strip it."""
+    if source and title.endswith(f" - {source}"):
+        return title[: -len(source) - 3].strip()
+    if " - " in title:
+        head, tail = title.rsplit(" - ", 1)
+        if len(tail) < 40:
+            return head.strip()
+    return title.strip()
+
+
+def fetch_body(url, paragraphs=2):
+    """First couple of real paragraphs from the article page."""
+    try:
+        r = session.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+    except Exception:
+        return ""
+    soup = BeautifulSoup(r.text, "html.parser")
+    scope = soup.find("article") or soup
+    paras = []
+    for p in scope.find_all("p"):
+        t = re.sub(r"\s+", " ", p.get_text(" ")).strip()
+        if len(t) > 80 and "cookie" not in t.lower():
+            paras.append(t)
+        if len(paras) >= paragraphs:
+            break
+    return "\n\n".join(paras)
+
+
+def mentions(text, words, case_sensitive=False):
+    if not words:
+        return False
+    flags = 0 if case_sensitive else re.IGNORECASE
+    for w in words:
+        # word boundaries for Latin words; plain substring for Arabic
+        pattern = rf"\b{re.escape(w)}\b" if re.match(r"[A-Za-z0-9]", w) else re.escape(w)
+        if re.search(pattern, text, flags):
+            return True
+    return False
+
+
+def is_junk(title):
+    return any(re.search(p, title, re.IGNORECASE) for p in JUNK_TITLE_PATTERNS)
+
+
+def norm_tokens(title):
+    return {w for w in re.findall(r"\w+", title.lower()) if len(w) > 3}
+
+
+def is_duplicate(title, seen):
+    toks = norm_tokens(title)
+    if not toks:
+        return False
+    for other in seen:
+        overlap = len(toks & other) / max(1, len(toks | other))
+        if overlap >= 0.6:
+            return True
+    return False
+
+
+def fmt_label(dt):
+    return dt.astimezone(LOCAL_TZ).strftime("%a %d %b, %H:%M")
+
+
+# --------------------------------------------------------------------------
+# COLLECTION
+# --------------------------------------------------------------------------
+def collect_candidates(section, days):
+    """Yield raw items (dicts) for a section from feeds and queries."""
+    for feed in section.get("feeds", []):
+        for e in fetch_feed(feed["url"]):
+            yield {
+                "source": feed["source"],
+                "kind": "direct",
+                "title": clean_text(e.get("title", "")),
+                "link": e.get("link", ""),
+                "summary": clean_text(e.get("summary", "")),
+                "dt": entry_time(e),
+            }
+    for q in section.get("queries", []):
+        url = gnews_url(q["q"], q.get("hl", "en"), days)
+        for e in fetch_feed(url):
+            src = (e.get("source") or {}).get("title") or q.get("source_hint") or "Google News"
+            title = split_gnews_title(clean_text(e.get("title", "")), src)
+            summary = clean_text(e.get("summary", ""))
+            # Google News summaries just repeat headline + publisher
+            if summary.startswith(title[:40]):
+                summary = ""
+            yield {
+                "source": src,
+                "kind": "gnews",
+                "title": title,
+                "link": e.get("link", ""),
+                "summary": summary,
+                "dt": entry_time(e),
+            }
+
+
+def passes_filters(item, section):
+    text = f"{item['title']} {item['summary']}"
+    if is_junk(item["title"]):
+        return False
+    if section.get("include") and not mentions(text, section["include"]):
+        return False
+    if mentions(text, section.get("exclude", [])):
+        return False
+    if section.get("require_context") and not mentions(text, SPORT_CONTEXT):
+        return False
+    return True
+
+
+def build(hours, with_body=True):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=hours)
+    days = max(1, math.ceil(hours / 24))
+
+    seen_links, seen_titles = set(), []
+    sections_out, order = {}, []
+
+    def accept(item, section_name):
+        if not item["title"] or not item["link"] or not item["dt"]:
+            return False
+        if item["dt"] < cutoff or item["link"] in seen_links:
+            return False
+        if is_duplicate(item["title"], seen_titles):
+            return False
+        seen_links.add(item["link"])
+        seen_titles.append(norm_tokens(item["title"]))
+        return True
+
+    def finalise(item, section_name):
+        body = ""
+        if with_body and item["kind"] == "direct":
+            body = fetch_body(item["link"])
+            time.sleep(0.5)
+        out = {
+            "section": section_name,
+            "source": item["source"],
+            "kind": item["kind"],
+            "title": item["title"],
+            "link": item["link"],
+            "published": item["dt"].isoformat(),
+            "published_label": fmt_label(item["dt"]),
+            "summary": item["summary"],
+            "body": body,
+            "copy": body or (item["summary"] if item["kind"] == "direct" else ""),
+        }
+        if item.get("competitor"):
+            out["competitor"] = item["competitor"]
+        return out
+
+    # Regular sections
+    for section in SECTIONS:
+        name = section["name"]
+        log(f"[{name}]")
+        candidates = [c for c in collect_candidates(section, days) if passes_filters(c, section)]
+        candidates.sort(key=lambda c: c["dt"] or cutoff, reverse=True)
+        kept = []
+        for c in candidates:
+            if len(kept) >= section.get("max", 15):
+                break
+            if accept(c, name):
+                kept.append(finalise(c, name))
+        sections_out[name] = kept
+        order.append(name)
+        log(f"  kept {len(kept)} of {len(candidates)}")
+
+    # Competitor section
+    log(f"[{COMPETITOR_SECTION}]")
+    comp_items = []
+    for brand, cfg in COMPETITORS["brands"].items():
+        q = cfg.get("q") or f'"{brand}" (sponsorship OR partnership OR sponsor OR "official partner")'
+        for c in collect_candidates({"queries": [{"q": q}]}, days):
+            # brand must be in the HEADLINE (case-sensitive) + sport context
+            if not mentions(c["title"], cfg["aliases"], case_sensitive=True):
+                continue
+            if not mentions(f"{c['title']} {c['summary']}", SPORT_CONTEXT):
+                continue
+            if is_junk(c["title"]):
+                continue
+            c["competitor"] = brand
+            comp_items.append(c)
+    comp_items.sort(key=lambda c: c["dt"] or cutoff, reverse=True)
+    kept = []
+    for c in comp_items:
+        if len(kept) >= COMPETITORS["max"]:
+            break
+        if accept(c, COMPETITOR_SECTION):
+            kept.append(finalise(c, COMPETITOR_SECTION))
+    sections_out[COMPETITOR_SECTION] = kept
+    order.append(COMPETITOR_SECTION)
+    log(f"  kept {len(kept)} of {len(comp_items)}")
+
+    return {
+        "generated_at": now.isoformat(),
+        "generated_label": now.astimezone(LOCAL_TZ).strftime("%A %d %B %Y, %H:%M GST"),
+        "window_hours": hours,
+        "section_order": order,
+        "sections": sections_out,
+        "total": sum(len(v) for v in sections_out.values()),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ADNOC sports news digest")
+    ap.add_argument("--hours", type=int, default=DEFAULT_HOURS)
+    ap.add_argument("--out", type=Path, default=OUTPUT_PATH)
+    ap.add_argument("--no-body", action="store_true", help="skip scraping article bodies")
+    args = ap.parse_args()
+
+    digest = build(args.hours, with_body=not args.no_body)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(digest, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"Wrote {digest['total']} items to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
